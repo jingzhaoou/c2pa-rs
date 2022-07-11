@@ -109,8 +109,8 @@ pub fn main() -> Result<()> {
         .add_assertion(&creative_work)?;
 
     // sign and embed into the target file
-    let signcert_path = "../sdk/tests/fixtures/certs.ps256.pem";
-    let pkey_path = "../sdk/tests/fixtures/certs.ps256.pub";
+    let signcert_path = "./sdk/tests/fixtures/certs/ps256.pub";
+    let pkey_path = "./sdk/tests/fixtures/certs/ps256.pem";
     let signer = get_signer_from_files(signcert_path, pkey_path, "ps256", None)?;
 
     manifest.embed(&source, &dest, &*signer)?;

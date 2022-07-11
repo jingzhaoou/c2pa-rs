@@ -30,7 +30,7 @@ pub(crate) fn add_manifest_uri_to_file<P: AsRef<Path>>(
 
     let mut f = XmpFile::new();
 
-    f.open_file(path, OpenFileOptions::OPEN_FOR_UPDATE)?;
+    f.open_file(path, OpenFileOptions::default().for_update())?;
 
     let mut m = f.xmp().unwrap_or_else(XmpMeta::new);
     m.set_property("http://purl.org/dc/terms/", "provenance", manifest_uri);
