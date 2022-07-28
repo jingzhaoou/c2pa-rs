@@ -21,7 +21,7 @@ pub use bmff_hash::{BmffHash, DataMap, ExclusionsMap, SubsetMap};
 
 #[allow(dead_code)] // will become public later
 mod data_hash;
-pub(crate) use data_hash::DataHash;
+pub use data_hash::DataHash;
 
 mod creative_work;
 pub use creative_work::CreativeWork;

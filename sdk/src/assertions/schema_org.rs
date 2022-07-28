@@ -134,6 +134,7 @@ pub struct SchemaDotOrgPerson(SchemaDotOrg);
 
 impl SchemaDotOrgPerson {
     pub const PERSON: &'static str = "Person";
+    pub const ORGANIZATION: &'static str = "Organization";
     pub const NAME: &'static str = "name";
     pub const IDENTIFIER: &'static str = "identifier";
     pub const CREDENTIAL: &'static str = "credential";
@@ -144,6 +145,12 @@ impl SchemaDotOrgPerson {
 
     pub fn new_person<S: Into<String>>(name: S, identifier: S) -> Result<Self> {
         Self(SchemaDotOrg::new(Self::PERSON.to_owned()))
+            .set_name(name)?
+            .set_identifier(identifier)
+    }
+
+    pub fn new_organization<S: Into<String>>(name: S, identifier: S) -> Result<Self> {
+        Self(SchemaDotOrg::new(Self::ORGANIZATION.to_owned()))
             .set_name(name)?
             .set_identifier(identifier)
     }
