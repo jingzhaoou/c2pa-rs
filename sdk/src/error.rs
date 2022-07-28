@@ -136,6 +136,12 @@ pub enum Error {
     #[error("WASM verifier error")]
     WasmVerifier,
 
+    #[error("WASM RSA-PSS key import error: {0}")]
+    WasmRsaKeyImport(String),
+
+    #[error("WASM RSA-PSS verification error")]
+    WasmRsaVerification,
+
     #[error("WASM crypto key error")]
     WasmKey,
 
@@ -148,6 +154,9 @@ pub enum Error {
     /// Unable to generate valid JUMBF for a claim.
     #[error("could not create valid JUMBF for claim")]
     JumbfCreationError,
+
+    #[error("thread receive error")]
+    ThreadReceiveError,
 
     /// No JUMBF data found.
     /// TODO before merging PR: Does this error case need to be part of the public API?
@@ -215,6 +224,7 @@ pub enum Error {
     JsonError(#[from] serde_json::Error),
 
     #[error(transparent)]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "add_thumbnails"))]
     ImageError(#[from] image::ImageError),
 
     #[error(transparent)]

@@ -14,7 +14,7 @@
 use crate::{
     assertion::{Assertion, AssertionBase, AssertionDecodeError, AssertionDecodeErrorCause},
     assertions::{labels, Ingredient, Relationship},
-    claim::{Claim, ClaimAssertion},
+    claim::{Claim, ClaimAssertion, ClaimAssetData},
     error::{Error, Result},
     hash_utils::{hash_by_alg, vec_compare, verify_by_alg},
     jumbf::{self, boxes::*},
@@ -358,9 +358,38 @@ impl Store {
         &self,
         claim: &Claim,
         signer: &dyn AsyncSigner,
+        box_size: usize,
     ) -> Result<Vec<u8>> {
+        use crate::cose_sign::cose_sign_async;
+        use crate::cose_validator::verify_cose_async;
+
         let claim_bytes = claim.data()?;
-        signer.sign(&claim_bytes).await
+
+        match cose_sign_async(signer, &claim_bytes, box_size).await {
+            // Sanity check: Ensure that this signature is valid.
+            Ok(sig) => {
+                let mut cose_log = OneShotStatusTracker::new();
+                match verify_cose_async(
+                    sig.clone(),
+                    claim_bytes,
+                    b"".to_vec(),
+                    false,
+                    &mut cose_log,
+                )
+                .await
+                {
+                    Ok(_) => Ok(sig),
+                    Err(err) => {
+                        error!(
+                            "Signature that was just generated does not validate: {:#?}",
+                            err
+                        );
+                        Err(err)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// return the current provenance claim label if available
@@ -980,10 +1009,10 @@ impl Store {
     }
 
     // wake the ingredients and validate
-    fn ingredient_checks(
+    fn ingredient_checks<'a>(
         store: &Store,
         claim: &Claim,
-        asset_bytes: &[u8],
+        asset_data: &ClaimAssetData<'a>,
         validation_log: &mut impl StatusTracker,
     ) -> Result<()> {
         let mut num_parent_ofs = 0;
@@ -1026,7 +1055,7 @@ impl Store {
 
                     // make sure
                     // verify the ingredient claim
-                    Claim::verify_claim(ingredient, asset_bytes, false, validation_log)?;
+                    Claim::verify_claim(ingredient, asset_data, false, validation_log)?;
                 } else {
                     let log_item = log_item!(
                         &c2pa_manifest.url(),
@@ -1181,18 +1210,18 @@ impl Store {
     /// xmp_str: String containing entire XMP block of the asset
     /// asset_bytes: bytes of the asset to be verified
     /// validation_log: If present all found errors are logged and returned, other wise first error causes exit and is returned  
-    pub fn verify_store(
+    pub fn verify_store<'a>(
         store: &Store,
         xmp_opt: Option<String>,
-        asset_bytes: &[u8],
+        asset_data: &ClaimAssetData<'a>,
         validation_log: &mut impl StatusTracker,
     ) -> Result<()> {
         let claim = Store::provenance_checks(store, xmp_opt, validation_log)?;
 
         // verify the provenance claim
-        Claim::verify_claim(claim, asset_bytes, true, validation_log)?;
+        Claim::verify_claim(claim, asset_data, true, validation_log)?;
 
-        Store::ingredient_checks(store, claim, asset_bytes, validation_log)?;
+        Store::ingredient_checks(store, claim, asset_data, validation_log)?;
 
         Ok(())
     }
@@ -1395,8 +1424,36 @@ impl Store {
         let jumbf_bytes = self.start_save(asset_path, output_path, signer.reserve_size())?;
 
         let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
-        let sig = self.sign_claim_async(pc, signer).await?;
+        let sig = self
+            .sign_claim_async(pc, signer, signer.reserve_size())
+            .await?;
         let sig_placeholder = self.sign_claim_placeholder(pc, signer.reserve_size());
+
+        match self.finish_save(jumbf_bytes, output_path, sig, &sig_placeholder) {
+            Ok(v) => {
+                // save sig so store is up to date
+                let pc_mut = self.provenance_claim_mut().ok_or(Error::ClaimEncoding)?;
+                pc_mut.set_signature_val(v);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Embed the claims store as jumbf into an asset using an CoseSign box generated remotely. Updates XMP with provenance record.
+    #[cfg(feature = "async_signer")]
+    pub async fn save_to_asset_remote_signed(
+        &mut self,
+        asset_path: &Path,
+        remote_signer: &dyn crate::signer::RemoteSigner,
+        output_path: &Path,
+    ) -> Result<()> {
+        let jumbf_bytes = self.start_save(asset_path, output_path, remote_signer.reserve_size())?;
+
+        let pc = self.provenance_claim().ok_or(Error::ClaimEncoding)?;
+        let sig = remote_signer.sign_remote(&pc.data()?).await?;
+
+        let sig_placeholder = self.sign_claim_placeholder(pc, remote_signer.reserve_size());
 
         match self.finish_save(jumbf_bytes, output_path, sig, &sig_placeholder) {
             Ok(v) => {
@@ -1429,8 +1486,7 @@ impl Store {
         // update XMP info & add xmp hash to provenance claim
         #[cfg(feature = "xmp_write")]
         if let Some(provenance) = self.provenance_path() {
-            embedded_xmp::add_manifest_uri_to_file(output_path, &provenance)
-                .map_err(|_err| Error::XmpWriteError)?;
+            embedded_xmp::add_manifest_uri_to_file(output_path, &provenance)?;
         } else {
             return Err(Error::XmpWriteError);
         }
@@ -1549,17 +1605,38 @@ impl Store {
     /// asset_path: path to input asset
     /// validation_log: If present all found errors are logged and returned, otherwise first error causes exit and is returned  
     #[cfg(feature = "file_io")]
-    pub fn verify_from_path(
+    pub fn verify_from_path<'a>(
         &mut self,
-        asset_path: &Path,
+        asset_path: &'a Path,
         validation_log: &mut impl StatusTracker,
     ) -> Result<()> {
         let ext = get_supported_file_extension(asset_path).ok_or(Error::UnsupportedType)?;
 
-        // load the bytes
-        let buf = fs::read(asset_path).map_err(crate::error::wrap_io_err)?;
+        let cai_loader = get_cailoader_handler(&ext).ok_or(Error::UnsupportedType)?;
 
-        self.verify_from_buffer(&buf, &ext, validation_log)
+        let mut asset_reader = fs::File::open(asset_path)?;
+
+        // read xmp if available
+        let xmp_opt = cai_loader.read_xmp(&mut asset_reader);
+
+        let xmp_copy = xmp_opt.clone();
+
+        Store::verify_store(
+            self,
+            xmp_opt,
+            &ClaimAssetData::PathData(asset_path),
+            validation_log,
+        )?;
+
+        // set the provenance if there is xmp otherwise it will default to active manifest
+        if let Some(xmp) = xmp_copy {
+            if let Some(xmp_provenance) = extract_provenance(&xmp) {
+                let claim_label = Store::manifest_label_from_path(&xmp_provenance);
+                self.set_provenance_path(&claim_label);
+            }
+        }
+
+        Ok(())
     }
 
     // verify from a buffer without file i/o
@@ -1580,7 +1657,12 @@ impl Store {
 
         let buf = buf_reader.into_inner();
 
-        Store::verify_store(self, xmp_opt, buf, validation_log)?;
+        Store::verify_store(
+            self,
+            xmp_opt,
+            &ClaimAssetData::ByteData(buf),
+            validation_log,
+        )?;
 
         // set the provenance if there is xmp otherwise it will default to active manifest
         if let Some(xmp) = xmp_copy {
@@ -1695,22 +1777,25 @@ impl Store {
     /// data: reference to bytes of the the file
     /// verify: if true will run verification checks when loading
     /// validation_log: If present all found errors are logged and returned, otherwise first error causes exit and is returned
-    pub fn load_from_memory(
+    pub fn load_from_memory<'a>(
         asset_type: &str,
-        data: &[u8],
+        data: &'a [u8],
         verify: bool,
         validation_log: &mut impl StatusTracker,
     ) -> Result<Store> {
         Store::get_store_from_memory(asset_type, data, validation_log).and_then(
             |(mut store, xmp_opt)| {
-                let buf_reader = Cursor::new(data);
-
                 // verify the store
                 if verify {
                     let xmp_copy = xmp_opt.clone();
 
                     // verify store and claims
-                    Store::verify_store(&store, xmp_opt, buf_reader.get_ref(), validation_log)?;
+                    Store::verify_store(
+                        &store,
+                        xmp_opt,
+                        &ClaimAssetData::ByteData(data),
+                        validation_log,
+                    )?;
 
                     // set the provenance if checks pass & has xmp, otherwise default to active manifest
                     if let Some(xmp) = xmp_copy {
@@ -1869,6 +1954,7 @@ pub mod tests {
                 create_test_claim, fixture_path, temp_dir_path, temp_fixture_path, temp_signer,
             },
         },
+        SigningAlg,
     };
 
     fn create_editing_claim(claim: &mut Claim) -> Result<&mut Claim> {
@@ -2015,8 +2101,8 @@ pub mod tests {
             Ok(b"not a valid signature".to_vec())
         }
 
-        fn alg(&self) -> Option<String> {
-            None
+        fn alg(&self) -> SigningAlg {
+            SigningAlg::Ps256
         }
 
         fn certs(&self) -> Result<Vec<Vec<u8>>> {
@@ -2025,6 +2111,27 @@ pub mod tests {
 
         fn reserve_size(&self) -> usize {
             42
+        }
+    }
+
+    #[cfg(feature = "async_signer")]
+    struct MyRemoteSigner {}
+
+    #[cfg(feature = "async_signer")]
+    #[async_trait::async_trait]
+    impl crate::signer::RemoteSigner for MyRemoteSigner {
+        async fn sign_remote(&self, claim_bytes: &[u8]) -> crate::error::Result<Vec<u8>> {
+            let signer =
+                crate::openssl::temp_signer_async::AsyncSignerAdapter::new(SigningAlg::Ps256);
+
+            // this would happen on some remote server
+            let cose_sign1_box =
+                crate::cose_sign::cose_sign_async(&signer, claim_bytes, self.reserve_size()).await;
+
+            cose_sign1_box
+        }
+        fn reserve_size(&self) -> usize {
+            10000
         }
     }
 
@@ -2055,7 +2162,7 @@ pub mod tests {
     #[test]
     #[cfg(feature = "file_io")]
     fn test_sign_with_expired_cert() {
-        use crate::{openssl::RsaSigner, signer::ConfigurableSigner};
+        use crate::{openssl::RsaSigner, signer::ConfigurableSigner, SigningAlg};
 
         // test adding to actual image
         let ap = fixture_path("earth_apollo17.jpg");
@@ -2069,7 +2176,7 @@ pub mod tests {
         let signcert_path = fixture_path("rsa-pss256_key-expired.pub");
         let pkey_path = fixture_path("rsa-pss256-expired.pem");
         let signer =
-            RsaSigner::from_files(signcert_path, pkey_path, "ps256".to_string(), None).unwrap();
+            RsaSigner::from_files(signcert_path, pkey_path, SigningAlg::Ps256, None).unwrap();
 
         store.commit_claim(claim).unwrap();
 
@@ -2114,79 +2221,91 @@ pub mod tests {
         assert!(find_bytes(&buf, &original_jumbf[0..1024]).is_none());
     }
 
-    /*  async signing not supported at the moment
-        NOTE: Add this to Cargo.toml if this test is restored.
+    #[cfg(feature = "async_signer")]
+    #[actix::test]
+    async fn test_jumbf_generation_async() {
+        let signer = crate::openssl::temp_signer_async::AsyncSignerAdapter::new(SigningAlg::Ps256);
 
-        [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-        actix = "0.11.0"
+        // test adding to actual image
+        let ap = fixture_path("earth_apollo17.jpg");
+        let temp_dir = tempdir().expect("temp dir");
+        let op = temp_dir_path(&temp_dir, "test-async.jpg");
 
-        #[cfg(feature = "async_signer")]
-        #[actix::test]
-        async fn test_jumbf_generation_async() {
-            let signer = crate::AsyncPlaceholder {};
+        // Create claims store.
+        let mut store = Store::new();
 
-            // test adding to actual image
-            let ap = fixture_path("earth_apollo17.jpg");
-            let temp_dir = tempdir().expect("temp dir");
-            let op = temp_dir_path(&temp_dir, "test-async.jpg");
+        // Create a new claim.
+        let claim1 = create_test_claim().unwrap();
 
-            // Create claims store.
-            let mut store = Store::new();
+        // Create a new claim.
+        let mut claim2 = Claim::new("Photoshop", Some("Adobe"));
+        create_editing_claim(&mut claim2).unwrap();
 
-            // Create a new claim.
-            let claim1 = create_test_claim().unwrap();
+        // Create a 3rd party claim
+        let mut claim_capture = Claim::new("capture", Some("claim_capture"));
+        create_capture_claim(&mut claim_capture).unwrap();
 
-            // Create a new claim.
-            let mut claim2 = Claim::new("Photoshop", Some("Adobe"));
-            create_editing_claim(&mut claim2).unwrap();
+        // Test generate JUMBF
+        // Get labels for label test
+        let claim1_label = claim1.label().to_string();
+        let capture = claim_capture.label().to_string();
+        let claim2_label = claim2.label().to_string();
 
-            // Create a 3rd party claim
-            let mut claim_capture = Claim::new("capture", Some("claim_capture"));
-            create_capture_claim(&mut claim_capture).unwrap();
+        store.commit_claim(claim1).unwrap();
+        store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
+        store.commit_claim(claim_capture).unwrap();
+        store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
+        store.commit_claim(claim2).unwrap();
+        store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
 
-            // Test generate JUMBF
-            // Get labels for label test
-            let claim1_label = claim1.label().to_string();
-            let capture = claim_capture.label().to_string();
-            let claim2_label = claim2.label().to_string();
+        // test finding claims by label
+        let c1 = store.get_claim(&claim1_label);
+        let c2 = store.get_claim(&capture);
+        let c3 = store.get_claim(&claim2_label);
+        assert_eq!(&claim1_label, c1.unwrap().label());
+        assert_eq!(&capture, c2.unwrap().label());
+        assert_eq!(claim2_label, c3.unwrap().label());
 
-            /*
-            Move the claim to claims list. Note this is not real, the claims would have to be signed in between commits
-            */
-            store.commit_claim(claim1).unwrap();
-            store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
-            store.commit_claim(claim_capture).unwrap();
-            store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
-            store.commit_claim(claim2).unwrap();
-            store.save_to_asset_async(&ap, &signer, &op).await.unwrap();
+        // Do we generate JUMBF
+        let jumbf_bytes = store.to_jumbf_async(&signer).unwrap();
+        assert!(!jumbf_bytes.is_empty());
 
-            // test finding claims by label
-            let c1 = store.get_claim(&claim1_label);
-            let c2 = store.get_claim(&capture);
-            let c3 = store.get_claim(&claim2_label);
-            assert_eq!(&claim1_label, c1.unwrap().label());
-            assert_eq!(&capture, c2.unwrap().label());
-            assert_eq!(claim2_label, c3.unwrap().label());
+        // write to new file
+        println!("Provenance: {}\n", store.provenance_path().unwrap());
 
-            // Do we generate JUMBF
-            let jumbf_bytes = store.to_jumbf_async(&signer).unwrap();
-            assert!(!jumbf_bytes.is_empty());
+        // make sure we can read from new file
+        let mut report = DetailedStatusTracker::new();
+        let _new_store = Store::load_from_asset(&op, true, &mut report).unwrap();
+    }
 
-            // write to new file
-            println!("Provenance: {}\n", store.provenance_path().unwrap());
+    #[cfg(feature = "async_signer")]
+    #[actix::test]
+    async fn test_jumbf_generation_remote() {
+        // test adding to actual image
+        let ap = fixture_path("earth_apollo17.jpg");
+        let temp_dir = tempdir().expect("temp dir");
+        let op = temp_dir_path(&temp_dir, "test-async.jpg");
 
-            // read from new file
-            let mut report: Vec<ValidationItem> = Vec::new();
-            let new_store = Store::load_from_asset(&op, true, Some(&mut report)).unwrap();
-            // Async placeholder signature won't verify. We need the load to complete,
-            // but we ignore the validation log which we know will have errors.
+        // Create claims store.
+        let mut store = Store::new();
 
-            let claim = new_store.provenance_claim().unwrap();
-            let sig = claim.signature_val();
+        // Create a new claim.
+        let claim1 = create_test_claim().unwrap();
 
-            assert_eq!(&sig[0..19], b"invalid signature\0\0");
-        }
-    */
+        // create my remote signer to map the CoseSign1 data back into the asset
+        let remote_signer = MyRemoteSigner {};
+
+        store.commit_claim(claim1).unwrap();
+        store
+            .save_to_asset_remote_signed(&ap, &remote_signer, &op)
+            .await
+            .unwrap();
+
+        // make sure we can read from new file
+        let mut report = DetailedStatusTracker::new();
+        let _new_store = Store::load_from_asset(&op, true, &mut report).unwrap();
+    }
+
     #[test]
     #[cfg(feature = "file_io")]
     fn test_png_jumbf_generation() {

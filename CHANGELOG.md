@@ -6,6 +6,53 @@ This project adheres to [Semantic Versioning](https://semver.org), except that â
 
 Do not manually edit this file. It will be automatically updated when a new release is published.
 
+## 0.11.0
+_21 July 2022_
+
+* (MINOR) Add support for remotely generated CoseSign1 signatures ([#87](https://github.com/contentauth/c2pa-rs/pull/87))
+* Optimize performance of large assets ([#84](https://github.com/contentauth/c2pa-rs/pull/84))
+
+## 0.10.0
+_20 July 2022_
+
+* Add Unicode license to allow-list ([#85](https://github.com/contentauth/c2pa-rs/pull/85))
+* (MINOR) `IngredientOptions` allow override of hash and thumbnail generation; image library is now a default feature ([#79](https://github.com/contentauth/c2pa-rs/pull/79))
+
+## 0.9.1
+_19 July 2022_
+
+* Fix publish workflow ([#82](https://github.com/contentauth/c2pa-rs/pull/82))
+
+## 0.9.0
+_19 July 2022_
+
+* (MINOR) Introduce a new `SigningAlg` enum ([#76](https://github.com/contentauth/c2pa-rs/pull/76))
+* Support for asynchronous signing of claims ([#57](https://github.com/contentauth/c2pa-rs/pull/57))
+* Adds an add_validation_status method to Ingredient ([#68](https://github.com/contentauth/c2pa-rs/pull/68))
+
+## 0.8.1
+_15 July 2022_
+
+* Use rsa crate for RSA-PSS verification in Wasm ([#77](https://github.com/contentauth/c2pa-rs/pull/77))
+
+## 0.8.0
+_15 July 2022_
+
+* Add a new API to provide access to COSE signing logic for external signers ([#75](https://github.com/contentauth/c2pa-rs/pull/75))
+* (MINOR) Move crate-level functions for creating signers to new public `create_signer` mod ([#72](https://github.com/contentauth/c2pa-rs/pull/72))
+
+## 0.7.2
+_14 July 2022_
+
+* Fix broken documentation build ([#74](https://github.com/contentauth/c2pa-rs/pull/74))
+
+## 0.7.1
+_14 July 2022_
+
+* Configure docs.rs to include feature-gated items ([#73](https://github.com/contentauth/c2pa-rs/pull/73))
+* Update XMP Toolkit to 0.5.0 ([#71](https://github.com/contentauth/c2pa-rs/pull/71))
+* Refactor code to limit memory usage and remove data copies during hash generation ([#67](https://github.com/contentauth/c2pa-rs/pull/67))
+
 ## 0.7.0
 _29 June 2022_
 

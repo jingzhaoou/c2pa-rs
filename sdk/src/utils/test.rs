@@ -23,9 +23,10 @@ use crate::{
 
 #[cfg(feature = "file_io")]
 use crate::{
-    get_signer_from_files,
+    create_signer,
     openssl::RsaSigner,
     signer::{ConfigurableSigner, Signer},
+    SigningAlg,
 };
 
 use std::path::PathBuf;
@@ -205,14 +206,11 @@ pub fn temp_signer() -> RsaSigner {
     pem_key_path.push("ps256");
     pem_key_path.set_extension("pem");
 
-    RsaSigner::from_files(&sign_cert_path, &pem_key_path, "ps256".to_string(), None)
+    RsaSigner::from_files(&sign_cert_path, &pem_key_path, SigningAlg::Ps256, None)
         .expect("get_temp_signer")
 }
 
 /// Create a [`Signer`] instance for a specific algorithm that can be used for testing purposes.
-///
-/// # Parameters:
-/// alg: The algorithm to use
 ///
 /// # Returns
 ///
@@ -223,18 +221,18 @@ pub fn temp_signer() -> RsaSigner {
 /// Can panic if the certs cannot be read. (This function should only
 /// be used as part of testing infrastructure.)
 #[cfg(feature = "file_io")]
-pub fn temp_signer_with_alg(alg: &str) -> Box<dyn Signer> {
+pub fn temp_signer_with_alg(alg: SigningAlg) -> Box<dyn Signer> {
     #![allow(clippy::expect_used)]
     // sign and embed into the target file
     let mut sign_cert_path = fixture_path("certs");
-    sign_cert_path.push(alg);
+    sign_cert_path.push(alg.to_string());
     sign_cert_path.set_extension("pub");
 
     let mut pem_key_path = fixture_path("certs");
-    pem_key_path.push(alg);
+    pem_key_path.push(alg.to_string());
     pem_key_path.set_extension("pem");
 
-    get_signer_from_files(sign_cert_path.clone(), pem_key_path, alg, None)
+    create_signer::from_files(sign_cert_path.clone(), pem_key_path, alg, None)
         .expect("get_temp_signer_with_alg")
 }
 
